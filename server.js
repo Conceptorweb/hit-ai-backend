@@ -2,6 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import pg from "pg";
+import crypto from "crypto";
 
 const { Pool } = pg;
 
@@ -17,6 +18,12 @@ const PORT = process.env.PORT || 3000;
 const FREE_MONTHLY_LIMIT = 50;
 const BASIC_MONTHLY_LIMIT = 500;
 const PREMIUM_MONTHLY_LIMIT = 1200;
+
+// Anti-fraud guardrails. These are intentionally conservative to avoid blocking normal users.
+const FREE_MAX_USER_IDS_PER_IP_MONTH = 5;
+const FREE_MAX_REQUESTS_PER_IP_MONTH = 160;
+const USER_MAX_REQUESTS_PER_MINUTE = 8;
+
 
 if (!OPENAI_API_KEY) {
   console.warn("WARNING: OPENAI_API_KEY is missing.");
@@ -38,6 +45,16 @@ function currentMonthKey() {
   const year = now.getUTCFullYear();
   const month = String(now.getUTCMonth() + 1).padStart(2, "0");
   return `${year}-${month}`;
+}
+
+function currentMinuteKey() {
+  const now = new Date();
+  const year = now.getUTCFullYear();
+  const month = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(now.getUTCDate()).padStart(2, "0");
+  const hour = String(now.getUTCHours()).padStart(2, "0");
+  const minute = String(now.getUTCMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hour}:${minute}`;
 }
 
 function cleanUserId(userId) {
@@ -83,6 +100,25 @@ function requireAppSecret(req, res) {
   return true;
 }
 
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.length > 0) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket?.remoteAddress || "unknown";
+}
+
+function hashValue(value) {
+  const secretSalt = HIT_AI_APP_SECRET || "hit-ai-local-salt";
+  return crypto.createHash("sha256").update(`${secretSalt}:${value}`).digest("hex");
+}
+
+function safeNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+
 async function initDatabase() {
   if (!pool) return;
 
@@ -94,6 +130,27 @@ async function initDatabase() {
       used_count INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS hit_ai_user_rate_limits (
+      user_id TEXT NOT NULL,
+      minute_key TEXT NOT NULL,
+      request_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, minute_key)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS hit_ai_ip_monthly_guard (
+      ip_hash TEXT NOT NULL,
+      usage_month TEXT NOT NULL,
+      request_count INTEGER NOT NULL DEFAULT 0,
+      user_ids TEXT[] NOT NULL DEFAULT '{}',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (ip_hash, usage_month)
     );
   `);
 }
@@ -148,11 +205,76 @@ async function incrementUsage(userId) {
   return result.rows[0];
 }
 
+async function checkUserBurstLimit(userId) {
+  const minuteKey = currentMinuteKey();
+
+  const result = await pool.query(
+    `
+      INSERT INTO hit_ai_user_rate_limits (user_id, minute_key, request_count)
+      VALUES ($1, $2, 1)
+      ON CONFLICT (user_id, minute_key) DO UPDATE
+      SET request_count = hit_ai_user_rate_limits.request_count + 1,
+          updated_at = NOW()
+      RETURNING request_count;
+    `,
+    [userId, minuteKey]
+  );
+
+  const count = safeNumber(result.rows[0]?.request_count);
+  return count <= USER_MAX_REQUESTS_PER_MINUTE;
+}
+
+async function checkFreeIpMonthlyGuard(req, userId, plan) {
+  if (plan !== "free") {
+    return { allowed: true };
+  }
+
+  const ipHash = hashValue(getClientIp(req));
+  const monthKey = currentMonthKey();
+
+  const result = await pool.query(
+    `
+      INSERT INTO hit_ai_ip_monthly_guard (ip_hash, usage_month, request_count, user_ids)
+      VALUES ($1, $2, 1, ARRAY[$3]::TEXT[])
+      ON CONFLICT (ip_hash, usage_month) DO UPDATE
+      SET request_count = hit_ai_ip_monthly_guard.request_count + 1,
+          user_ids = CASE
+            WHEN NOT ($3 = ANY(hit_ai_ip_monthly_guard.user_ids))
+            THEN array_append(hit_ai_ip_monthly_guard.user_ids, $3)
+            ELSE hit_ai_ip_monthly_guard.user_ids
+          END,
+          updated_at = NOW()
+      RETURNING request_count, cardinality(user_ids) AS user_count;
+    `,
+    [ipHash, monthKey, userId]
+  );
+
+  const requestCount = safeNumber(result.rows[0]?.request_count);
+  const userCount = safeNumber(result.rows[0]?.user_count);
+
+  if (userCount > FREE_MAX_USER_IDS_PER_IP_MONTH) {
+    return {
+      allowed: false,
+      reason: "Too many free installations detected on this network this month. Please upgrade or try again later."
+    };
+  }
+
+  if (requestCount > FREE_MAX_REQUESTS_PER_IP_MONTH) {
+    return {
+      allowed: false,
+      reason: "Free network limit reached this month. Please upgrade to continue."
+    };
+  }
+
+  return { allowed: true };
+}
+
 app.get("/health", async (req, res) => {
   res.json({
     ok: true,
     database: Boolean(pool),
-    month: currentMonthKey()
+    month: currentMonthKey(),
+    antiFraud: true
   });
 });
 
@@ -193,10 +315,34 @@ app.post("/ask", async (req, res) => {
       });
     }
 
+    const burstAllowed = await checkUserBurstLimit(userId);
+    if (!burstAllowed) {
+      return res.status(429).json({
+        error: "Too many requests. Please wait a moment before asking again.",
+        plan,
+        used: userBefore.used_count,
+        limit: monthlyLimit,
+        remaining: Math.max(monthlyLimit - userBefore.used_count, 0)
+      });
+    }
+
+    const ipGuard = await checkFreeIpMonthlyGuard(req, userId, plan);
+    if (!ipGuard.allowed) {
+      return res.status(429).json({
+        error: ipGuard.reason,
+        plan,
+        used: userBefore.used_count,
+        limit: monthlyLimit,
+        remaining: Math.max(monthlyLimit - userBefore.used_count, 0)
+      });
+    }
+
     const systemPrompt =
       mode === "step"
-        ? "Answer briefly but clearly. Use short steps only if needed."
-        : "Answer very briefly. No extra words. Clear and direct.";
+        ? "You are Hit AI on Apple Watch. Answer in the user's language. Be clear, useful, and structured in short numbered steps. Keep it compact for a small screen, but do not omit essential information."
+        : "You are Hit AI on Apple Watch. Answer in the user's language. Be direct, accurate, and concise. Prefer 2-5 short sentences or compact bullets when useful. Do not add filler.";
+
+    const maxTokens = mode === "step" ? 520 : 220;
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -210,7 +356,8 @@ app.post("/ask", async (req, res) => {
           { role: "system", content: systemPrompt },
           { role: "user", content: question }
         ],
-        max_tokens: 120
+        max_tokens: maxTokens,
+        temperature: 0.3
       })
     });
 
